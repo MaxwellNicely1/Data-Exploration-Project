@@ -1,0 +1,140 @@
+---
+title: "Data Exploration Project"
+author: "Maxwell Nicely"
+date: '2022-05-15'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We begin with importing the necessary libraries for this project.As well as importing the files that have the data.
+```{r}
+library(tidyverse)
+library(fixest)
+library(lubridate)
+```
+
+```{r}
+file_names <- list.files(pattern = "trend", full.names = TRUE)
+
+trends <- map_df(file_names, read_csv)
+
+# to clean up the code some more, rows with null values will be omitted
+trends <- na.omit(trends)
+
+trends$monthorweek <- trends %>% pull(monthorweek) %>% 
+  str_sub(start = 1, end = 10) %>% ymd()
+
+# now we will standardize the indexes
+trends <- trends %>%
+  group_by(schname, keyword) %>%
+  mutate(index = ((index - mean(index)) / sd(index)))
+
+# we will also take the average index of each school for each week
+trends <- trends %>% group_by(schname, monthorweek) %>%
+  summarize(index = mean(index))
+```
+I decided to look at the average index for each school during each time period. This gets rid of the index for each keyword and instead gives an average for the interest in each school for each week.
+
+```{r}
+Scorecard <- read_csv("Most+Recent+Cohorts+(Scorecard+Elements).csv")
+
+# this will convert the median earnings from a character value to a numeric
+Scorecard$med_income <- as.numeric(Scorecard$`md_earn_wne_p10-REPORTED-EARNINGS`)
+
+# this will gives us a single cost column for the schools,
+# using the information of average costs for public and private schools
+
+# first we convert the public and private cost variables to numeric values
+Scorecard$`NPT4_PUB-AVERAGE-ANNUAL-COST` <- as.numeric(Scorecard$`NPT4_PUB-AVERAGE-ANNUAL-COST`)
+Scorecard$NPT4_PRIV <- as.numeric(Scorecard$NPT4_PRIV)
+
+# now we can set each NA value in the columns to 0
+Scorecard$`NPT4_PUB-AVERAGE-ANNUAL-COST`[is.na(Scorecard$`NPT4_PUB-AVERAGE-ANNUAL-COST`)] <- 0
+Scorecard$NPT4_PRIV[is.na(Scorecard$NPT4_PRIV)] <- 0
+
+# now we can make a new column cost, and add the two columns to get one column
+# that tells us the cost of each school
+Scorecard <- Scorecard %>%
+  mutate(cost = `NPT4_PUB-AVERAGE-ANNUAL-COST` + NPT4_PRIV)
+
+# now for the analysis to work well, we can set any remaining 0 values back to NA
+Scorecard$cost[Scorecard$cost == 0] <- NA
+```
+
+```{r}
+id_name_link <- read_csv('id_name_link.csv')
+
+id_name_link <- id_name_link %>%
+  group_by(schname) %>%
+  mutate(n = n())
+
+id_name_link <- id_name_link %>%
+  filter(n == 1)
+```
+
+```{r}
+# now we will join the three data frames together
+join1 <- inner_join(trends, id_name_link, by = c("schname" = 'schname'))
+trndanlys <- inner_join(join1, Scorecard, by = c('unitid' = 'UNITID'))
+```
+
+```{r}
+# now we will edit our final data frame a bit to fit our analysis better
+
+# first, we will remove all the schools that don't predominantly offer bachelor's degrees
+trndanlys <- trndanlys %>% filter(PREDDEG == 3)
+
+# now we will remove the schools who have a median income in the 'middle'
+trndanlys <- trndanlys %>% filter(med_income <= 35500 | med_income >= 48100)
+
+# we will add a binary value for if a school is a high income school or not
+trndanlys <- trndanlys %>% mutate(highincome = med_income >= 48100)
+
+# we will add a binary value for if the time is after the release of the scorecard or not
+trndanlys <- trndanlys %>% mutate(scorecard = monthorweek >= '2015-09-01')
+```
+I decided for the data to remove the middle income schools from the data since we are interested in high income and low income schools. To determine what is high income vs low income, I looked at the quartiles for the median incomes. The 25% level was \$35500 and the 75% was \$48100. Based off that, a school was dedicated low-income if it had a median income less than \$35500 and high-income if it was greater than \$48100. While it is somewhat arbitrary, the 25% and 75% cutoffs seem like good places to separate the schools as it would also give us low-middle and high-middle ranges for any future analysis.
+
+Now that the data is fully cleaned and all the necessary extra variables have been added, we can run a regression and do some analysis.
+
+To get a general sense of what the data looks like, we will plot the indexes by the date, also highlighting which indexes correspond to a low-income or high-income school.
+```{r}
+# before we plot, we'll make a new variable that takes the mean of each index when grouped by the time and the income of the graduates 
+trndanlys <- trndanlys %>% group_by(monthorweek, med_income) %>%
+  mutate(indexmean = mean(index))
+
+ggplot() + geom_point(data = subset(trndanlys, med_income >= 48100), aes(x = monthorweek, y = indexmean), size = 1)
+
+ggplot() + geom_point(data = subset(trndanlys, med_income <= 35500), aes(x = monthorweek, y = indexmean), size = 1) 
+#scale_color_manual(values = c('high' = 'blue', 'low' = 'red'))
+```
+Both graphs show the variable `indexmean` as time progresses. (`indexmean` was used to show the cyclical nature better.) The first one is for the schools deemed to be on the low income side. The second is for the schools on the high income side. While it does seem hard to tell, there seems to be a cyclical nature to the values of index. This would make sense when we assume that there are more searches for schools at different times of the year. This indicates we should add the date variable to the regression model.
+
+And now, we can plot some graphs to see how some of the variables interact. First, we'll look at `cost` and income. The thinking behind this is that schools that have higher costs for tuition justify those costs in part by helping their graduates earn more money later on. We'll also look at `cost` and `index`
+```{r}
+ggplot(Scorecard, aes(cost, med_income), na.rm=TRUE) + geom_point() + geom_smooth(method = 'lm')
+ggplot() + geom_point(data = trndanlys, aes(cost, index), na.rm=TRUE)
+ggplot(trndanlys, aes(med_income, index), na.rm=TRUE) + geom_point()
+```
+
+While the first graph doesn't give a great idea of how `med_income` can change with `cost`, it does appear that there is a possible linear relationship. Shown by the line in the graph, we see that the relationship is positive as well. This makes sense when we think back to the assumption, that the higher costs are offset by higher incomes later on. In the second graph, it's hard to tell if there's any outright relationship. One thing to note is that there appears to be less extremes for schools that cost more. In fact, there's less variation in the index values for schools with higher costs. This would make sense if we think that students may conduct less searches for schools that cost more, preferring to look at the less expensive schools. Because of these graphs, we'll assume that `cost` is related to both the `med_income`, as well as `index`, and we'll introduce it to our regression as a control. The third graph also just gives us a visual of how the `index` of a school varies with regard to the `med_income`. We'll note that it looks like there's greater variance in interest among the schools with a lower `med_income`.
+
+```{r}
+ggplot() + geom_point(data = subset(trndanlys, med_income >= 48100), aes(scorecard, index, color = 'high'), size = 4) + geom_point(data = subset(trndanlys, med_income <= 35500), aes(scorecard, index, color = 'low'), size = 1) + scale_color_manual(values = c('high' = 'blue', 'low' = 'orange'))
+```
+Now we've plotted a graph of the indexes separated by those before and after the release of the Scorecard. The graph is also colored to show the difference between the high income and low income schools. For both the high and low incomes, it looks like the indexes were more spread out before the release of the scorecard and slightly more concentrated after. If we look at the means we can see there was a small increase for both the high and low income schools after the release of the scorecard. And looking at the variances, those both decreased by a small amount from before to after the release of the scorecard.
+
+To create our regression, we'll add two interaction terms. The first is an interaction term between `med_income` and `scorecard`, which we'll add because we are interested in knowing if the effect of a school being high-income is changed after the introduction of the scorecard. The second interaction term we'll add is one between `med_income` and `monthorweek` since our previous graph showed changes in the indexes over time. It's reasonable to assume that there will also be a difference in the level of effect from `highincome` over time. And as mentioned earlier, we'll add a control for `cost`. That means our equation will be: 
+`index` = $\beta$~0~ + $\beta$~1~`med_income` + $\beta$~2~`scorecard` + $\beta$~3~`med_income`\*`scorecard` + $\beta$~4~`monthorweek` + $\beta$~5~`med_income`\*`monthorweek` + $\beta$~6~`cost`.
+
+Performing this analysis will give us an idea of how the `med_income` value of a school impacts the value of `index`. Because we're looking at what the impact of the Scorecard was, adding the interaction term between it and `med_income` will tell us how the value of a school's graduates' incomes changed after that release.
+```{r}
+analysis <- feols(index ~ med_income*scorecard + med_income*monthorweek  + cost, data = trndanlys)
+etable(analysis)
+```
+Looking at the results of the regression, we see there is an intercept of 6.853. This doesn't give us much information, but I will note that it is a little high when compared to the data, but I believe that is due to how the variable `monthorweek` is handled by R in regressions (with large numeric values for dates). For `med_income` we have a coefficient of 0.0002. This means that, when the value of `monthorweek` = 0 and `scorecardTRUE`=0, a one-unit increase in `med_income` is associated with a 0.0002 increase in `index`. This seems like a small change, but it may be more reasonable to think of larger unit increases for `med_income`, since differences between incomes aren't usually denoted by single-dollar values. So a 1000-unit increase in `med_income` is associated with a 0.2 increase in `index`. After the introduction of the Scorecard, the coefficient for `med_income` is 2.0428e-4, a small difference from before the Scorecard introduction. Now both of those numbers are without considering the variable `monthorweek`. The true coefficient for `med_income` is $\beta$~1~ + $\beta$~2~`scorecard` + $\beta$~3~`monthorweek`. That means for a set value for `monthorweek`, it is 2.0427037e-4 when `scorecard` = 0, and 1.9999037e-4 when `scorecard` = 1. The coefficient on `monthorweek` is -0.0004. This implies that as `monthorweek` increases, there is an associated decrease in `index`. We will also note there is a coefficient of -1.73e-9 on the variable `cost`. So as the value of `cost` increases, there is an associated decrease in `index`.
+
+Beginning with the `cost` variable, a negative coefficient makes sense when compared to the assumption we made earlier. Students will be more likely to prefer a less expensive school, so as the costs increase, we would expect less interest. The positive value on the `med_income` variable seems logical as well. As the expected income of graduates increase, students will be more interested in that school (assuming, all else equal, students are interested in making more money after graduation). The positive value on `med_income x scorecardTRUE` also means that schools in general saw an increase in interest after the Scorecard was released. The results of the regression imply that the impact of the Scorecard was positive for schools, and the higher the `med_income` of a school, the greater the impact from the Scorecard, since there was a 0.0002 value for `scorecardTRUE` and a 4.28e-6 value for `med_income x scorecardTRUE`. But the increase in the impact of a school's `med_income` after the release was relatively small. Overall, from the regression, we should expect that a school with a higher `med_income` will see a higher level of interest after the release of the Scorecard.
